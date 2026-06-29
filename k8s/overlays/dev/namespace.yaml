@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-azure-demo-dev
+  labels:
+    app: k8s-azure-demo
+    env: dev

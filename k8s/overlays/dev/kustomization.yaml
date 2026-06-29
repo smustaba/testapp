@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Point to the shared base
+resources:
+  - ../../base
+  - namespace.yaml
+
+# Override namespace on all namespaced resources
+namespace: k8s-azure-demo-dev
+
+# Environment label on every resource
+commonLabels:
+  env: dev
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: k8s-azure-demo
+  - path: configmap-patch.yaml
+    target:
+      kind: ConfigMap
+      name: k8s-azure-demo-config
+  - path: ingress-patch.yaml
+    target:
+      kind: Ingress
+      name: k8s-azure-demo

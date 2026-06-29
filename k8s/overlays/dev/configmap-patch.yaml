@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-azure-demo-config
+data:
+  APP_VERSION: "dev"
+  DB_PROVIDER: "memory"

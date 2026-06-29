@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log*
+.env
+coverage
+.DS_Store
+.git
+.gitignore
+k8s
+azure-pipelines.yml
+README.md

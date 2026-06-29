@@ -1,0 +1,193 @@
+# azure-pipelines.yml
+# On-premise Kubernetes (1 master + 1 worker, Ubuntu Linux)
+#
+# Prerequisites (configure in Azure DevOps project settings):
+#   1. SERVICE CONNECTIONS
+#      - Docker Registry connection named: ACR_SERVICE_CONNECTION
+#        (can also be Docker Hub or any private registry)
+#      - Kubernetes connection named: K8S_SERVICE_CONNECTION
+#        Type: Kubernetes Service Connection → KubeConfig
+#        Paste the contents of ~/.kube/config from your master node
+#
+#   2. SELF-HOSTED AGENT (recommended for on-premise)
+#      Install the Azure Pipelines agent on your master or a dedicated
+#      Ubuntu machine on the same network as your cluster:
+#        https://learn.microsoft.com/azure/devops/pipelines/agents/linux-agent
+#      Then set AGENT_POOL below to the pool name you created.
+#      Alternatively keep vmImage: ubuntu-latest if the Azure-hosted agent
+#      can reach your cluster (e.g. via VPN or public IP + firewall rule).
+#
+#   3. VARIABLE GROUP named "k8s-azure-demo-vars" in Pipelines → Library:
+#       ACR_NAME   = <registry-host>           e.g. myacr.azurecr.io or index.docker.io/myuser
+#       ACR_REPO   = k8s-azure-demo            image repository name
+#       DB_USER    = <postgres-user>           mark as secret variable
+#       DB_PASSWORD = <postgres-password>      mark as secret variable
+#       SONAR_TOKEN = <sonarqube-token>        mark as secret variable
+#       SONAR_HOST_URL = <sonarqube-url>       e.g. http://sonarqube:9000
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: k8s-azure-demo-vars
+  - name: IMAGE_TAG
+    value: $(Build.BuildId)
+  - name: IMAGE_FULL
+    value: $(ACR_NAME)/$(ACR_REPO):$(IMAGE_TAG)
+  # Set to your self-hosted agent pool name, or use 'Default' if you haven't renamed it.
+  # If using Azure-hosted agents (cluster reachable from internet) set to 'Azure Pipelines'.
+  - name: AGENT_POOL
+    value: on-premise-agents
+
+stages:
+  # ─────────────────────────────────────────────
+  # Stage 1 — CI: install, test, build & push
+  # ─────────────────────────────────────────────
+  - stage: CI
+    displayName: Build & Test
+    jobs:
+      - job: UnitTests
+        displayName: Run unit tests
+        pool:
+          name: $(AGENT_POOL)   # self-hosted agent on your Ubuntu machine
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: Install Node.js 20
+
+          - script: npm ci
+            displayName: Install dependencies
+
+          - script: npm test -- --ci --coverage --reporters=default --reporters=jest-junit
+            displayName: Run Jest tests
+            env:
+              JEST_JUNIT_OUTPUT_DIR: $(Agent.TempDirectory)/test-results
+
+          - script: npx sonar-scanner
+            displayName: Run SonarQube analysis
+            env:
+              SONAR_TOKEN: $(SONAR_TOKEN)
+              SONAR_HOST_URL: $(SONAR_HOST_URL)
+            condition: succeeded()
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '$(Agent.TempDirectory)/test-results/*.xml'
+              mergeTestResults: true
+              testRunTitle: Unit Tests
+
+          - task: PublishCodeCoverageResults@2
+            condition: always()
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: coverage/cobertura-coverage.xml
+              failIfCoverageEmpty: false
+
+      - job: BuildAndPush
+        displayName: Docker build & push to registry
+        dependsOn: UnitTests
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        pool:
+          name: $(AGENT_POOL)
+        steps:
+          - task: Docker@2
+            displayName: Build image
+            inputs:
+              command: build
+              repository: $(ACR_REPO)
+              dockerfile: Dockerfile
+              containerRegistry: ACR_SERVICE_CONNECTION
+              tags: |
+                $(IMAGE_TAG)
+                latest
+              arguments: '--build-arg APP_VERSION=$(Build.BuildId)'
+
+          - task: Docker@2
+            displayName: Push image to ACR
+            inputs:
+              command: push
+              repository: $(ACR_REPO)
+              containerRegistry: ACR_SERVICE_CONNECTION
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+  # ─────────────────────────────────────────────
+  # Stage 2 — CD: deploy to on-premise cluster
+  # ─────────────────────────────────────────────
+  - stage: Deploy
+    displayName: Deploy to On-Premise K8s
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToK8s
+        displayName: kubectl apply to on-premise cluster
+        environment: production       # add approval gates here in Pipelines → Environments
+        pool:
+          name: $(AGENT_POOL)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: KubernetesManifest@1
+                  displayName: Create/Update namespace
+                  inputs:
+                    action: deploy
+                    connectionType: kubernetesServiceEndpoint
+                    kubernetesServiceConnection: K8S_SERVICE_CONNECTION
+                    manifests: k8s/overlays/prod/namespace.yaml
+
+                - task: KubernetesManifest@1
+                  displayName: Create/Update DB Secret
+                  inputs:
+                    action: createSecret
+                    connectionType: kubernetesServiceEndpoint
+                    kubernetesServiceConnection: K8S_SERVICE_CONNECTION
+                    namespace: k8s-azure-demo
+                    secretType: generic
+                    secretName: k8s-azure-demo-secrets
+                    secretArguments: --from-literal=DB_USER=$(DB_USER) --from-literal=DB_PASSWORD=$(DB_PASSWORD)
+
+                # Deploy prod overlay and substitute application image tag.
+                - task: KubernetesManifest@1
+                  displayName: Deploy prod overlay
+                  inputs:
+                    action: deploy
+                    connectionType: kubernetesServiceEndpoint
+                    kubernetesServiceConnection: K8S_SERVICE_CONNECTION
+                    namespace: k8s-azure-demo
+                    manifests: k8s/overlays/prod
+                    containers: $(IMAGE_FULL)
+
+                - task: KubernetesManifest@1
+                  displayName: Verify rollout
+                  inputs:
+                    action: patch
+                    connectionType: kubernetesServiceEndpoint
+                    kubernetesServiceConnection: K8S_SERVICE_CONNECTION
+                    namespace: k8s-azure-demo
+                    kind: deployment
+                    name: k8s-azure-demo
+                    patchType: strategic
+                    patch: '{"spec":{"template":{"metadata":{"annotations":{"azure-pipelines/buildId":"$(Build.BuildId)"}}}}}'
+
+                - task: Kubernetes@1
+                  displayName: Wait for rollout
+                  inputs:
+                    connectionType: Kubernetes Service Connection
+                    kubernetesServiceEndpoint: K8S_SERVICE_CONNECTION
+                    command: rollout
+                    arguments: status deployment/k8s-azure-demo -n k8s-azure-demo --timeout=180s
